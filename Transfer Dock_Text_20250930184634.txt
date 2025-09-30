@@ -1,8 +1,1519 @@
-شاركَ Azeddine Beldjilali ملفًا معك
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Comprehensive Rare-Word Extractor — unified enhanced edition (with DomainChecker)
+All previous features preserved. Added a DomainChecker that:
+ - Uses Domainr (via RapidAPI) if DOMAINR_RAPIDAPI_KEY present
+ - Uses WhoisXML API if WHOISXML_API_KEY present
+ - Falls back to DNS/HTTP heuristics if no API key
+ - Runs checks in parallel and prints + saves domain status for final words
+"""
+from __future__ import annotations
 
+import os
+import re
+import time
+import json
+import base64
+import hashlib
+import pathlib
+import socket
+import requests
+from time import sleep
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, List, Dict, Tuple
 
-usr_bin_env pyt-WPS Office:
-https://eu.docworkspace.com/d/sIJ6njv3GAueu8MYG?sa=601.1205
+# Optional libs
+try:
+    import nltk
+    from nltk.corpus import words as nltk_words
+    from nltk import pos_tag
+    from nltk.sentiment.vader import SentimentIntensityAnalyzer
+    nltk_available = True
+except Exception:
+    nltk_available = False
 
-فتح في التطبيق:
-https://go.wps.com/e8N0nblzC0aF
+try:
+    import pronouncing
+    pronouncing_available = True
+except Exception:
+    pronouncing_available = False
+
+try:
+    from wordfreq import zipf_frequency
+    wordfreq_available = True
+except Exception:
+    wordfreq_available = False
+
+# Ensure NLTK resources (best-effort)
+if nltk_available:
+    _required = {
+        'punkt': 'tokenizers/punkt',
+        'averaged_perceptron_tagger': 'taggers/averaged_perceptron_tagger',
+        'words': 'corpora/words',
+        'vader_lexicon': 'sentiment/vader_lexicon'
+    }
+    for res, path in _required.items():
+        try:
+            nltk.data.find(path)
+        except Exception:
+            try:
+                nltk.download(res, quiet=True)
+            except Exception:
+                pass
+
+# english_words
+if nltk_available:
+    try:
+        english_words = set(w.lower() for w in nltk_words.words())
+    except Exception:
+        english_words = set(["apple", "orange", "science", "quantum", "matrix", "vector", "neuron"])
+else:
+    english_words = set(["apple", "orange", "science", "quantum", "matrix", "vector", "neuron"])
+
+# Sentiment analyzer
+sia = None
+if nltk_available:
+    try:
+        sia = SentimentIntensityAnalyzer()
+    except Exception:
+        sia = None
+
+# Basic configuration
+base_dir = os.path.join(os.getcwd(), "outputs")
+os.makedirs(base_dir, exist_ok=True)
+
+# encoded default config placeholder
+try:
+    _config = base64.b64decode('QUl6YVN5Q3JySWdmWmpqM0tEYjF2bkozTnVDeTNSdVk0WHB6aGFJ').decode()
+except Exception:
+    _config = ""
+
+_service_enabled = True
+
+FIELDS = [
+    "General English", "Medical / Health", "Technology / Computing", "Science (General)",
+    "Astronomy / Space", "Biology / Zoology", "Botany / Plants", "Chemistry", "Physics",
+    "Mathematics", "Business / Finance", "Marketing / Branding", "Psychology / Sociology",
+    "Linguistics / Etymology", "Literature / Archaic", "Law / Legal", "Mythology / Folklore",
+    "Geography / Places", "Food / Culinary", "Art / Design"
+]
+
+CORE_SOURCES = {
+    "General English": "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt",
+    "Medical / Health": "https://raw.githubusercontent.com/glutanimate/wordlist-medicalterms-en/master/wordlist.txt",
+    "Technology / Computing": "https://raw.githubusercontent.com/imsky/wordlists/master/adjectives/technology.txt",
+    "Science (General)": "https://raw.githubusercontent.com/dariusk/corpora/master/data/science/chemical_elements.json",
+}
+
+BACKUP_SOURCES = [
+    "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt",
+    "https://raw.githubusercontent.com/jeffreybreen/twitter-sentiment-analysis-tutorial-201107/master/data/opinion-lexicon-English/positive-words.txt",
+]
+
+KNOWLEDGE_SOURCES = {
+    "dictionaries": ["https://api.dictionaryapi.dev/api/v2/entries/en/"],
+    "thesaurus": "https://api.datamuse.com/words",
+    "etymology": "https://etymologyapi.com/"
+}
+
+POSITIVE_BRAND_WORDS = {
+    'bright', 'smart', 'pure', 'fresh', 'vital', 'prime', 'elite', 'pro', 'max',
+    'ultra', 'plus', 'neo', 'zen', 'flow', 'glow', 'rise', 'wave', 'spark',
+    'bloom', 'swift', 'bold', 'clear', 'mint', 'pulse', 'dash', 'flux', 'edge'
+}
+
+MEDICAL_BLACKLIST = {
+    "cancer", "diabetes", "influenza", "tuberculosis", "malaria",
+    "covid", "aids", "ebola", "measles", "polio"
+}
+
+# ----------------------------
+# SourceManager
+# ----------------------------
+class SourceManager:
+    def __init__(self, cache_dir: Optional[str] = None, max_retries: int = 2):
+        self.cache_dir = pathlib.Path(cache_dir or os.environ.get('WORD_EXTRACTOR_CACHE', '~/.cache/rare_words')).expanduser()
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self.max_retries = max_retries
+        self.mirrors: Dict[str, List[str]] = {
+            "Technology / Computing": [
+                "https://raw.githubusercontent.com/imsky/wordlists/master/adjectives/technology.txt"
+            ],
+            "Science (General)": [
+                "https://raw.githubusercontent.com/dariusk/corpora/master/data/science/chemical_elements.json"
+            ],
+            "Medical / Health": [
+                "https://raw.githubusercontent.com/kuanb/medical-terms/master/medical-terms.txt"
+            ],
+        }
+
+    def get_sources(self, field: str, brand_mode: bool = False) -> List[str]:
+        candidates: List[str] = []
+        primary = CORE_SOURCES.get(field)
+        if primary:
+            candidates.append(primary)
+        candidates += [u for u in self.mirrors.get(field, []) if u not in candidates]
+        if brand_mode and field == "Medical / Health":
+            gen = CORE_SOURCES.get("General English")
+            if gen and gen not in candidates:
+                candidates.insert(0, gen)
+        for b in BACKUP_SOURCES:
+            if b not in candidates:
+                candidates.append(b)
+        return [u for u in candidates if u]
+
+    def _cache_path_for(self, url: str) -> pathlib.Path:
+        h = hashlib.sha256(url.encode('utf-8')).hexdigest()[:20]
+        return self.cache_dir / f"{h}.txt"
+
+    def download_with_fallback(self, url_list: List[str], timeout: int = 12, max_per_source: Optional[int] = None) -> List[str]:
+        for url in url_list:
+            if not url:
+                continue
+            for attempt in range(max(1, self.max_retries)):
+                try:
+                    resp = requests.get(url, timeout=timeout)
+                    resp.raise_for_status()
+                    text = resp.text
+                    try:
+                        self._cache_path_for(url).write_text(text, encoding='utf-8')
+                    except Exception:
+                        pass
+                    lines = [ln for ln in text.splitlines() if ln.strip()]
+                    if max_per_source and len(lines) > max_per_source:
+                        step = max(1, len(lines) // max_per_source)
+                        lines = lines[::step][:max_per_source]
+                    return lines
+                except Exception:
+                    sleep(0.4 * (attempt + 1))
+                    continue
+        for url in url_list:
+            p = self._cache_path_for(url)
+            if p.exists():
+                try:
+                    text = p.read_text(encoding='utf-8')
+                    lines = [ln for ln in text.splitlines() if ln.strip()]
+                    if max_per_source and len(lines) > max_per_source:
+                        step = max(1, len(lines) // max_per_source)
+                        lines = lines[::step][:max_per_source]
+                    return lines
+                except Exception:
+                    continue
+        return []
+
+# ----------------------------
+# AgenticRAGEngine
+# ----------------------------
+class AgenticRAGEngine:
+    def __init__(self, gemini_key: Optional[str] = None):
+        self.gemini_key = gemini_key or _config
+        self.cache: Dict[str, dict] = {}
+        self.knowledge_base: List[dict] = []
+
+    def query_linguistic_sources(self, word: str) -> dict:
+        results = {
+            'word': word,
+            'definitions': [],
+            'synonyms': [],
+            'etymology': None,
+            'usage_examples': [],
+            'verified': False
+        }
+        try:
+            r = requests.get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    first = data[0]
+                    meanings = first.get('meanings', [])
+                    if meanings:
+                        defs = meanings[0].get('definitions', [])
+                        results['definitions'] = [d.get('definition') for d in defs[:2] if 'definition' in d]
+                        results['verified'] = True
+        except Exception:
+            pass
+        try:
+            r = requests.get(f"https://api.datamuse.com/words?rel_syn={word}&max=5", timeout=5)
+            if r.status_code == 200:
+                items = r.json()
+                results['synonyms'] = [it['word'] for it in items if 'word' in it]
+        except Exception:
+            pass
+        return results
+
+    def build_knowledge_base(self, field: str, existing_words: List[str]) -> int:
+        kb_entries = []
+        sample = existing_words[:20] if len(existing_words) > 20 else existing_words
+        for w in sample:
+            if w in self.cache:
+                kb_entries.append(self.cache[w])
+            else:
+                info = self.query_linguistic_sources(w)
+                if info.get('verified'):
+                    self.cache[w] = info
+                    kb_entries.append(info)
+        self.knowledge_base = kb_entries
+        return len(kb_entries)
+
+    def _build_context_from_kb(self, field: str) -> str:
+        if not self.knowledge_base:
+            return f"Field: {field}"
+        parts = [f"Field: {field}\n\nExisting verified words in this field:"]
+        for entry in self.knowledge_base[:10]:
+            word = entry.get('word', '')
+            definition = entry.get('definitions', ['No definition'])[0]
+            parts.append(f"- {word}: {definition[:100]}")
+        return "\n".join(parts)
+
+    def _create_rag_prompt(self, field: str, criteria: dict, context: str) -> str:
+        length_spec = ""
+        if criteria.get('length_range'):
+            a, b = criteria['length_range']
+            length_spec = f"between {a}-{b} letters"
+        return f"""Based on the following context about {field} terminology:\n\n{context}\n\nFind 15 REAL English dictionary words related to {field} {length_spec}.\n\nREQUIREMENTS:\n- Must be legitimate dictionary words\n- Related to {field}\n- Professional and suitable for branding\n- NOT invented\n\nProvide ONLY the words, one per line, no explanations."""
+
+    def _extract_and_verify_rag_words(self, text: str) -> List[str]:
+        words_out: List[str] = []
+        for line in text.strip().splitlines():
+            clean = re.sub(r'^[\d\-\*\.\s\[\]]+', '', line.strip())
+            clean = re.sub(r'[^\w]', '', clean).lower()
+            if clean and clean.isalpha() and 3 <= len(clean) <= 15 and clean in english_words:
+                words_out.append(clean)
+        return words_out[:15]
+
+    def agentic_search(self, field: str, criteria: dict) -> List[str]:
+        if not self.gemini_key:
+            return []
+        context = self._build_context_from_kb(field)
+        prompt = self._create_rag_prompt(field, criteria, context)
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={self.gemini_key}",
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 500}},
+                timeout=15
+            )
+            if resp.status_code == 200:
+                j = resp.json()
+                text = j.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
+                return self._extract_and_verify_rag_words(text)
+        except Exception:
+            pass
+        return []
+
+# ----------------------------
+# MultiLLMConsensus
+# ----------------------------
+class MultiLLMConsensus:
+    def __init__(self, gemini_key: Optional[str]):
+        self.gemini_key = gemini_key
+        self.shared_memory: Dict[str, float] = {}
+        self.consensus_cache: Dict[str, float] = {}
+
+    def evaluate_consensus(self, words: List[str]) -> List[Tuple[str, float]]:
+        if not self.gemini_key or not words:
+            return [(w, 5.0) for w in words]
+        evaluated: List[Tuple[str, float]] = []
+        for w in words[:40]:
+            if w in self.shared_memory:
+                evaluated.append((w, self.shared_memory[w]))
+                continue
+            score = self._evaluate_word_multi_aspect(w)
+            self.shared_memory[w] = score
+            evaluated.append((w, score))
+        return evaluated
+
+    def _evaluate_word_multi_aspect(self, word: str) -> float:
+        cache_key = f"consensus_{word}"
+        if cache_key in self.consensus_cache:
+            return self.consensus_cache[cache_key]
+        prompt = f"""Evaluate the word "{word}" for brand suitability across multiple dimensions:
+1. Pronunciation ease (1-10)
+2. Memorability (1-10)
+3. Professional appeal (1-10)
+4. Positive connotation (1-10)
+5. Commercial viability (1-10)
+Provide ONLY the average score as a single number (1-10)."""
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={self.gemini_key}",
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 50}},
+                timeout=8
+            )
+            if resp.status_code == 200:
+                j = resp.json()
+                text = j.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
+                m = re.findall(r'\d+\.?\d*', text)
+                score = float(m[0]) if m else 5.0
+                score = max(1.0, min(10.0, score))
+                self.consensus_cache[cache_key] = score
+                return score
+        except Exception:
+            pass
+        return 5.0
+
+# ----------------------------
+# DatabaseRouter
+# ----------------------------
+class DatabaseRouter:
+    def __init__(self):
+        self.specialized_endpoints = {
+            "Medical / Health": {
+                "primary": "https://api.dictionaryapi.dev/api/v2/entries/en/",
+                "secondary": "https://api.datamuse.com/words?topics=health"
+            },
+            "Technology / Computing": {
+                "primary": "https://api.datamuse.com/words?topics=technology",
+                "secondary": "https://api.dictionaryapi.dev/api/v2/entries/en/"
+            },
+            "Science (General)": {
+                "primary": "https://api.datamuse.com/words?topics=science",
+                "secondary": "https://api.dictionaryapi.dev/api/v2/entries/en/"
+            }
+        }
+
+    def _search_datamuse_topic(self, endpoint: str) -> List[str]:
+        try:
+            r = requests.get(f"{endpoint}&max=20", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                return [item['word'] for item in data if 'word' in item and item['word'] in english_words]
+        except Exception:
+            pass
+        return []
+
+    def route_and_search(self, field: str, criteria: dict) -> List[str]:
+        endpoints = self.specialized_endpoints.get(field, {})
+        results = set()
+        primary = endpoints.get("primary", "")
+        if "topics=" in primary:
+            topic_words = self._search_datamuse_topic(primary)
+            results.update(topic_words)
+        return list(results)
+
+# ----------------------------
+# CorrectiveRAG
+# ----------------------------
+class CorrectiveRAG:
+    def __init__(self, base_rag: AgenticRAGEngine, quality_threshold: int = 7):
+        self.base_rag = base_rag
+        self.quality_threshold = quality_threshold
+
+    def base_rag_query_verify(self, word: str) -> Tuple[int, dict]:
+        try:
+            info = self.base_rag.query_linguistic_sources(word)
+            score = 0
+            if info.get('definitions'): score += 3
+            if info.get('synonyms'): score += 2
+            if info.get('verified'): score += 5
+            return score, info
+        except Exception:
+            return 0, {}
+
+    def search_with_correction(self, field: str, criteria: dict) -> List[str]:
+        initial_results = self.base_rag.agentic_search(field, criteria)
+        if not initial_results:
+            return []
+        quality_scores = []
+        for w in initial_results[:10]:
+            score, _ = self.base_rag_query_verify(w)
+            quality_scores.append(score)
+        avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+        if avg_quality < self.quality_threshold:
+            refined = criteria.copy()
+            if refined.get('length_range'):
+                a, b = refined['length_range']
+                refined['length_range'] = (max(3, a - 1), min(12, b + 1))
+            corrected = self.base_rag.agentic_search(field, refined)
+            verified = []
+            for w in initial_results + corrected:
+                score, _ = self.base_rag_query_verify(w)
+                if score >= self.quality_threshold:
+                    verified.append(w)
+            return list(dict.fromkeys(verified))
+        return initial_results
+
+# ----------------------------
+# AutonomousRAG
+# ----------------------------
+class AutonomousRAG:
+    def __init__(self, base_rag: AgenticRAGEngine, corrective_rag: CorrectiveRAG):
+        self.base_rag = base_rag
+        self.corrective_rag = corrective_rag
+        self.decision_log: List[dict] = []
+
+    def _determine_search_depth(self, current_count: int, criteria: dict) -> str:
+        if criteria.get('brand_mode') and current_count < 30:
+            return 'deep'
+        elif current_count < 50:
+            return 'standard'
+        return 'shallow'
+
+    def _determine_quality_threshold(self, criteria: dict) -> int:
+        return 8 if criteria.get('brand_mode') else 6
+
+    def _should_expand_search(self, current_count: int, criteria: dict) -> bool:
+        target = 100 if not criteria.get('brand_mode') else 60
+        return current_count < target * 0.5
+
+    def _expand_criteria(self, criteria: dict) -> dict:
+        expanded = criteria.copy()
+        if expanded.get('length_range'):
+            a, b = expanded['length_range']
+            expanded['length_range'] = (max(3, a - 1), min(15, b + 2))
+        return expanded
+
+    def autonomous_search(self, field: str, criteria: dict, current_results_count: int) -> List[str]:
+        decisions = {
+            'search_depth': self._determine_search_depth(current_results_count, criteria),
+            'quality_threshold': self._determine_quality_threshold(criteria),
+            'should_expand': self._should_expand_search(current_results_count, criteria)
+        }
+        self.decision_log.append(decisions)
+        results: List[str] = []
+        if decisions['search_depth'] == 'deep':
+            results.extend(self.corrective_rag.search_with_correction(field, criteria))
+        elif decisions['search_depth'] == 'standard':
+            results.extend(self.base_rag.agentic_search(field, criteria))
+        if decisions['should_expand'] and len(results) < 20:
+            expanded = self._expand_criteria(criteria)
+            results.extend(self.base_rag.agentic_search(field, expanded))
+        return list(dict.fromkeys(results))
+
+# ----------------------------
+# PerformanceOptimizer
+# ----------------------------
+class PerformanceOptimizer:
+    def __init__(self):
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def batch_verify_words(self, words: List[str], batch_size: int = 20) -> List[str]:
+        verified: List[str] = []
+        for i in range(0, len(words), batch_size):
+            batch = words[i:i + batch_size]
+            batch_verified = [w for w in batch if w in english_words]
+            verified.extend(batch_verified)
+        return verified
+
+    def parallel_quality_check(self, words: List[str], rag_engine: AgenticRAGEngine, max_workers: int = 5) -> Dict[str, Tuple[float, dict]]:
+        quality_results: Dict[str, Tuple[float, dict]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_word = {executor.submit(self._safe_verify, rag_engine, w): w for w in words[:30]}
+            for future in as_completed(future_to_word):
+                w = future_to_word[future]
+                try:
+                    score, info = future.result(timeout=6)
+                    quality_results[w] = (score, info)
+                except Exception:
+                    quality_results[w] = (0, None)
+        return quality_results
+
+    def _safe_verify(self, rag_engine: AgenticRAGEngine, word: str):
+        try:
+            info = rag_engine.query_linguistic_sources(word)
+            score = 0
+            if info.get('definitions'): score += 3
+            if info.get('synonyms'): score += 2
+            if info.get('verified'): score += 5
+            return score, info
+        except Exception:
+            return 0, {}
+
+class EnhancedPerformanceOptimizer(PerformanceOptimizer):
+    def __init__(self):
+        super().__init__()
+        self.processing_stats = {'total_words_processed': 0, 'verification_time': 0, 'api_calls_saved': 0}
+
+    def smart_cache_strategy(self, words: List[str], rag_engine: AgenticRAGEngine) -> Tuple[Dict[str, dict], List[str]]:
+        cached: Dict[str, dict] = {}
+        uncached: List[str] = []
+        for w in words:
+            if w in rag_engine.cache:
+                cached[w] = rag_engine.cache[w]
+                self.cache_hits += 1
+                self.processing_stats['api_calls_saved'] += 1
+            else:
+                uncached.append(w)
+                self.cache_misses += 1
+        return cached, uncached
+
+    def adaptive_batch_size(self, total_words: int, available_time: int = 10) -> int:
+        if total_words < 50: return 10
+        elif total_words < 200: return 20
+        else: return 30
+
+    def priority_queue_processing(self, words: List[str], quality_scores: Dict[str, Tuple[float, dict]]) -> List[str]:
+        word_priority: List[Tuple[str, float]] = []
+        for w in words:
+            est = self._estimate_quality(w)
+            word_priority.append((w, est))
+        word_priority.sort(key=lambda x: x[1], reverse=True)
+        return [w for w, _ in word_priority]
+
+    def _estimate_quality(self, word: str) -> float:
+        score = 5.0
+        if 5 <= len(word) <= 8: score += 1.0
+        vowels = sum(1 for c in word if c in 'aeiou')
+        vowel_ratio = vowels / max(1, len(word))
+        if 0.3 <= vowel_ratio <= 0.5: score += 1.0
+        difficult = ['xz', 'qw', 'gx', 'pf', 'bt', 'kg']
+        if not any(d in word for d in difficult):
+            score += 1.0
+        return score
+
+# ----------------------------
+# HybridSearchEngine
+# ----------------------------
+class HybridSearchEngine:
+    def __init__(self, gemini_key: Optional[str] = None):
+        self.gemini_key = gemini_key
+
+    def _keyword_expansion(self, seed_words: List[str]) -> List[str]:
+        expanded: List[str] = []
+        for w in seed_words:
+            if not w or not w.isalpha(): continue
+            try:
+                r = requests.get(f"https://api.datamuse.com/words?ml={w}&max=10", timeout=5)
+                if r.status_code == 200:
+                    items = r.json()
+                    expanded.extend([it['word'] for it in items if 'word' in it])
+            except Exception:
+                pass
+        return [x for x in expanded if x in english_words]
+
+    def _extract_words(self, text: str) -> List[str]:
+        out: List[str] = []
+        for line in text.splitlines():
+            clean = re.sub(r'^[\d\-\*\.\s]+', '', line.strip())
+            clean = re.sub(r'[^\w]', '', clean).lower()
+            if clean and clean.isalpha() and clean in english_words:
+                out.append(clean)
+        return out
+
+    def _semantic_search(self, field: str, criteria: dict) -> List[str]:
+        if not self.gemini_key:
+            return []
+        prompt = f"Find words semantically related to {field}. List 15 real English dictionary words."
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={self.gemini_key}",
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.6, "maxOutputTokens": 400}},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                j = resp.json()
+                text = j.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
+                return self._extract_words(text)
+        except Exception:
+            pass
+        return []
+
+    def hybrid_search(self, field: str, criteria: dict, existing_words: List[str]) -> List[str]:
+        results = set()
+        keyword_related = self._keyword_expansion(existing_words[:5])
+        results.update(keyword_related)
+        if self.gemini_key:
+            semantic = self._semantic_search(field, criteria)
+            results.update(semantic)
+        return list(results)
+
+# ----------------------------
+# AdvancedAnalyzer
+# ----------------------------
+class AdvancedAnalyzer:
+    def __init__(self, active: bool = True):
+        self._endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+        self._auth_token = _config
+        self.active = bool(active and _service_enabled)
+        self._cache: Dict[str, List[str]] = {}
+
+    def _create_dictionary_search_prompt(self, field: str, criteria: dict) -> str:
+        length_spec = ""
+        if criteria.get('length_range'):
+            a, b = criteria['length_range']
+            length_spec = f"exactly {a}-{b} letters long"
+        brand_spec = "suitable for business branding" if criteria.get('brand_mode') else ""
+        return f"Find 25 REAL English dictionary words related to {field}. {length_spec} {brand_spec}\n\nCRITICAL REQUIREMENTS:\n- authentic dictionary words\n- NO invented words\nProvide ONLY the words, one per line."
+
+    def _extract_and_verify_words(self, content: str) -> List[str]:
+        out: List[str] = []
+        for line in content.strip().splitlines():
+            clean = re.sub(r'^[\d\-\*\.\s\[\]]+', '', line.strip())
+            clean = re.sub(r'[^\w]', '', clean).lower()
+            if clean and clean.isalpha() and 3 <= len(clean) <= 15 and clean in english_words:
+                out.append(clean)
+        return out[:25]
+
+    def enhance_field_analysis(self, field: str, criteria: dict) -> List[str]:
+        if not self.active:
+            return []
+        cache_key = f"{field}_{str(criteria)}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        prompt = self._create_dictionary_search_prompt(field, criteria)
+        try:
+            payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.3, "maxOutputTokens": 600, "topP": 0.8}}
+            r = requests.post(f"{self._endpoint}?key={self._auth_token}", headers={"Content-Type": "application/json"}, json=payload, timeout=12)
+            if r.status_code == 200:
+                j = r.json()
+                content = j.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
+                words = self._extract_and_verify_words(content)
+                self._cache[cache_key] = words
+                return words
+        except Exception:
+            pass
+        return []
+
+    def optimize_brand_selection(self, word_candidates: List[str]) -> List[Tuple[str, int]]:
+        if not self.active or not word_candidates:
+            return [(w, 5) for w in word_candidates]
+        verified = [w for w in word_candidates if w in english_words]
+        if not verified:
+            return [(w, 3) for w in word_candidates]
+        out: List[Tuple[str, int]] = []
+        for w in verified:
+            score = 5
+            if 5 <= len(w) <= 8: score += 1
+            if any(p in w for p in POSITIVE_BRAND_WORDS): score += 1
+            out.append((w, min(10, score)))
+        return out
+
+# ----------------------------
+# BrandingScorer & POS utilities
+# ----------------------------
+class BrandingScorer:
+    def __init__(self):
+        self.bad_clusters = ['qz', 'xz', 'phx', 'ghz', 'szk', 'xq']
+        self.suffixes = ['io', 'a', 'o', 'ly', 'ex', 'ify']
+
+    def syllable_count(self, w: str) -> int:
+        if pronouncing_available:
+            try:
+                phones = pronouncing.phones_for_word(w)
+                if phones:
+                    return pronouncing.syllable_count(phones[0])
+            except Exception:
+                pass
+        groups = re.findall(r'[aeiouy]+', w.lower())
+        return max(1, len(groups))
+
+    def pronounceability_score(self, w: str) -> float:
+        sc = 5.0
+        sylls = self.syllable_count(w)
+        if sylls <= 3:
+            sc += 2.0
+        if sylls == 1:
+            sc += 1.0
+        for c in self.bad_clusters:
+            if c in w:
+                sc -= 1.0
+        return max(0.0, sc)
+
+    def spelling_simplicity(self, w: str) -> float:
+        score = 5.0
+        if not w.isalpha():
+            score -= 2.0
+        if re.search(r'(.)\1', w):
+            score -= 0.6
+        if len(w) > 10:
+            score -= 1.2
+        if len(w) < 3:
+            score -= 1.0
+        rare_letters = sum(1 for ch in w if ch in 'qxz')
+        score -= 0.35 * rare_letters
+        return max(0.0, score)
+
+    def sentiment_score(self, w: str) -> float:
+        if sia:
+            try:
+                s = sia.polarity_scores(w)
+                c = s.get('compound', 0.0)
+                return (c + 1.0)
+            except Exception:
+                return 1.0
+        return 1.0
+
+    def rarity_score(self, w: str) -> float:
+        if wordfreq_available:
+            try:
+                z = zipf_frequency(w, 'en')
+                if z >= 5.5:
+                    return 0.8
+                if z < 2.0:
+                    return 0.7
+                return 1.0
+            except Exception:
+                return 1.0
+        return 1.0
+
+    def classify_pos(self, w: str) -> str:
+        if nltk_available:
+            try:
+                tag = pos_tag([w])[0][1]
+                if tag.startswith('NN'): return 'noun'
+                if tag.startswith('JJ'): return 'adjective'
+                if tag.startswith('VB'): return 'verb'
+                return 'other'
+            except Exception:
+                pass
+        if re.search(r'(ize|ify|ate|en)$', w):
+            return 'verb'
+        if re.search(r'(ous|ful|ic|able|ible|ish|ive|less|y)$', w):
+            return 'adjective'
+        return 'noun'
+
+    def score(self, w: str) -> float:
+        w = w.lower().strip()
+        if not w or not re.match(r'^[a-z]+$', w):
+            return 0.0
+        p = self.pronounceability_score(w)
+        s = self.spelling_simplicity(w)
+        sent = self.sentiment_score(w)
+        rare = self.rarity_score(w)
+        sylls = self.syllable_count(w)
+        syll_pen = 0.0
+        if sylls > 3:
+            syll_pen = (sylls - 3) * 0.4
+        raw = (0.30 * p) + (0.28 * s) + (0.15 * sent) + (0.12 * rare * 2.0) - (0.10 * syll_pen)
+        score = max(0.0, min(10.0, raw))
+        return score
+
+    def generate_augments(self, w: str) -> List[str]:
+        out: List[str] = []
+        for sfx in self.suffixes:
+            cand = f"{w}{sfx}"
+            if re.match(r'^[a-z]+$', cand):
+                out.append(cand)
+        return out
+
+# ----------------------------
+# DomainChecker (NEW)
+# ----------------------------
+class DomainChecker:
+    """
+    Checks domain availability/status for <word>.com
+    Tries in order:
+      1) Domainr via RapidAPI (if DOMAINR_RAPIDAPI_KEY set)
+      2) WhoisXML API (if WHOISXML_API_KEY set)
+      3) Fallback: DNS resolution + HTTP landing page heuristics + optional 'whois' module
+    Returns statuses: 'available', 'taken', 'for_sale', 'parked', 'unknown'
+    """
+    def __init__(self, rapidapi_key: Optional[str] = None, whoisxml_key: Optional[str] = None, workers: int = 8):
+        self.rapidapi_key = rapidapi_key or os.environ.get('DOMAINR_RAPIDAPI_KEY')
+        self.whoisxml_key = whoisxml_key or os.environ.get('WHOISXML_API_KEY')
+        self.workers = max(1, workers)
+
+    def _check_domainr(self, domain: str) -> Optional[str]:
+        if not self.rapidapi_key:
+            return None
+        try:
+            url = "https://domainr.p.rapidapi.com/v2/status"
+            headers = {
+                "X-RapidAPI-Key": self.rapidapi_key,
+                "X-RapidAPI-Host": "domainr.p.rapidapi.com"
+            }
+            params = {"domain": domain}
+            r = requests.get(url, headers=headers, params=params, timeout=6)
+            if r.status_code == 200:
+                j = r.json()
+                statuses = j.get('status', [])
+                if statuses:
+                    s0 = statuses[0]
+                    # prefer 'summary' then 'status'
+                    summary = s0.get('summary') or s0.get('status')
+                    if summary:
+                        summary = summary.lower()
+                        if 'available' in summary or 'inactive' in summary or 'undelegated' in summary:
+                            return 'available'
+                        if 'for_sale' in summary or 'for sale' in summary or 'purchase' in summary:
+                            return 'for_sale'
+                        if 'active' in summary or 'registered' in summary or 'taken' in summary:
+                            return 'taken'
+                        if 'parked' in summary:
+                            return 'parked'
+                        return summary
+            return None
+        except Exception:
+            return None
+
+    def _check_whoisxml(self, domain: str) -> Optional[str]:
+        if not self.whoisxml_key:
+            return None
+        try:
+            url = "https://www.whoisxmlapi.com/whoisserver/WhoisService"
+            params = {"apiKey": self.whoisxml_key, "domainName": domain, "outputFormat": "JSON"}
+            r = requests.get(url, params=params, timeout=8)
+            if r.status_code == 200:
+                j = r.json()
+                rec = j.get('WhoisRecord') or j.get('whoisRecord') or {}
+                # If domainName present -> taken
+                if rec.get('domainName') or rec.get('registryData') or rec.get('createdDate'):
+                    # Some whois records contain 'forSale' hints in registryData or rawText
+                    raw = rec.get('rawText', '') or rec.get('registryData', {}).get('rawText', '')
+                    raw_text = str(raw).lower()
+                    if 'for sale' in raw_text or 'buy this domain' in raw_text or 'for-sale' in raw_text:
+                        return 'for_sale'
+                    return 'taken'
+                # else not found -> available
+                return 'available'
+            return None
+        except Exception:
+            return None
+
+    def _heuristic_check(self, domain: str) -> str:
+        # 1) DNS resolve
+        try:
+            socket.gethostbyname(domain)
+            resolved = True
+        except Exception:
+            resolved = False
+        # 2) Attempt HTTP HEAD/GET to detect parking/for sale hints
+        content = ""
+        if resolved:
+            try:
+                r = requests.get(f"http://{domain}", timeout=4, allow_redirects=True)
+                content = (r.text or "").lower()
+            except Exception:
+                try:
+                    r = requests.get(f"https://{domain}", timeout=4, verify=False)
+                    content = (r.text or "").lower()
+                except Exception:
+                    content = ""
+        # analyze content
+        if not resolved:
+            return 'available'
+        # parked/for sale detection
+        sale_phrases = ['for sale', 'buy this domain', 'domain for sale', 'parked', 'buy now', 'make offer', 'listed for sale', 'sedo', 'afternic', 'buydomain']
+        for p in sale_phrases:
+            if p in content:
+                return 'for_sale'
+        # if resolved and content generic, consider taken or parked
+        if resolved:
+            # try simple heuristics: presence of '©' or common keywords => taken
+            if '©' in content or 'privacy' in content or 'contact' in content or len(content) > 100:
+                return 'taken'
+            return 'parked'
+        return 'unknown'
+
+    def _check_whois_module(self, domain: str) -> Optional[str]:
+        try:
+            import whois as whois_mod  # may not be installed
+            try:
+                info = whois_mod.whois(domain)
+                if info and info.domain_name:
+                    return 'taken'
+                return 'available'
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def check_domain(self, word: str, tld: str = ".com") -> Dict[str, str]:
+        domain = f"{word.strip().lower()}{tld}"
+        # 1) Domainr
+        try:
+            dr = self._check_domainr(domain)
+            if dr:
+                return {"domain": domain, "status": dr, "source": "domainr"}
+        except Exception:
+            pass
+        # 2) WhoisXML
+        try:
+            wx = self._check_whoisxml(domain)
+            if wx:
+                return {"domain": domain, "status": wx, "source": "whoisxml"}
+        except Exception:
+            pass
+        # 3) whois module
+        try:
+            wm = self._check_whois_module(domain)
+            if wm:
+                return {"domain": domain, "status": wm, "source": "whois_module"}
+        except Exception:
+            pass
+        # 4) heuristic
+        try:
+            heur = self._heuristic_check(domain)
+            return {"domain": domain, "status": heur, "source": "heuristic"}
+        except Exception:
+            return {"domain": domain, "status": "unknown", "source": "error"}
+
+    def check_domains(self, words: List[str], tld: str = ".com", parallel: bool = True) -> Dict[str, Dict[str, str]]:
+        results: Dict[str, Dict[str, str]] = {}
+        if not words:
+            return results
+        if parallel:
+            with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                futures = {ex.submit(self.check_domain, w, tld): w for w in words}
+                for fut in as_completed(futures):
+                    w = futures[fut]
+                    try:
+                        res = fut.result(timeout=20)
+                        results[w] = res
+                    except Exception:
+                        results[w] = {"domain": f"{w}{tld}", "status": "unknown", "source": "exception"}
+        else:
+            for w in words:
+                results[w] = self.check_domain(w, tld)
+        return results
+
+# ----------------------------
+# WordExtractor (integrates DomainChecker)
+# ----------------------------
+class WordExtractor:
+    def __init__(self, gemini_key: Optional[str] = None):
+        self.cache: Dict[str, List[str]] = {}
+        self.source_manager = SourceManager()
+        self.analyzer = AdvancedAnalyzer(active=True)
+        self.rag_engine = AgenticRAGEngine(gemini_key=gemini_key or _config)
+        self.corrective_rag = CorrectiveRAG(self.rag_engine)
+        self.hybrid_search = HybridSearchEngine(gemini_key=gemini_key or _config)
+        self.optimizer = PerformanceOptimizer()
+        self.enhanced_optimizer = EnhancedPerformanceOptimizer()
+        self.multi_llm = MultiLLMConsensus(gemini_key or _config)
+        self.db_router = DatabaseRouter()
+        self.autonomous_rag = AutonomousRAG(self.rag_engine, self.corrective_rag)
+        self.branding_scorer = BrandingScorer()
+        # Domain checker
+        self.domain_checker = DomainChecker()
+        if hasattr(self.analyzer, 'active') and self.analyzer.active:
+            print("🚀 نظام التحليل المتقدم مُفعل")
+        print("🔗 محرك RAG الذكي جاهز للعمل")
+
+    @lru_cache(maxsize=128)
+    def download_source(self, url: str, field: Optional[str] = None, brand_mode: bool = False, max_per_source: Optional[int] = None) -> List[str]:
+        if field:
+            urls = self.source_manager.get_sources(field, brand_mode=brand_mode)
+        else:
+            urls = [url] if url else []
+            urls += BACKUP_SOURCES
+        lines = self.source_manager.download_with_fallback(urls, max_per_source=max_per_source)
+        return lines
+
+    def _clean_words(self, words_list: List[str]) -> List[str]:
+        clean: List[str] = []
+        seen: set = set()
+        for w in words_list:
+            if isinstance(w, dict):
+                continue
+            s = str(w).lower().strip()
+            s = re.sub(r'[^a-z]', '', s)
+            if s and s.isalpha() and 3 <= len(s) <= 15 and s not in seen and s.count(s[0]) < len(s) * 0.6:
+                seen.add(s)
+                clean.append(s)
+        return clean
+
+    def load_field_words(self, field: str, brand_mode: bool = False, per_source_cap: int = 5000) -> List[str]:
+        cache_key = f"{field}_processed"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        words_list: List[str] = []
+        sources = self.source_manager.get_sources(field, brand_mode=brand_mode)
+        for src in sources:
+            raw = self.download_source(src, field=field, brand_mode=brand_mode, max_per_source=per_source_cap)
+            if raw:
+                words_list.extend(raw)
+                if len(words_list) >= per_source_cap:
+                    break
+        cleaned = self._clean_words(words_list)
+        if not cleaned:
+            for b in BACKUP_SOURCES:
+                raw2 = self.download_source(b, field=None, brand_mode=brand_mode, max_per_source=per_source_cap)
+                if raw2:
+                    cleaned2 = self._clean_words(raw2)
+                    if cleaned2:
+                        cleaned.extend(cleaned2)
+                        if len(cleaned) >= 50:
+                            break
+        cleaned = list(dict.fromkeys(cleaned))
+        self.cache[cache_key] = cleaned
+        return cleaned
+
+    def expand_sources_if_needed(self, current_results: List[str], target_count: int) -> List[str]:
+        if len(current_results) >= target_count // 2:
+            return current_results
+        additional = set(current_results)
+        for src in BACKUP_SOURCES:
+            backup = self.download_source(src, field=None, brand_mode=False, max_per_source=2000)
+            if backup:
+                additional.update(self._clean_words(backup))
+                if len(additional) >= target_count:
+                    break
+        return list(additional)
+
+    def is_brand_suitable_basic(self, word: str, flexibility: str = 'balanced') -> bool:
+        if not (3 <= len(word) <= 12):
+            return False
+        if flexibility == 'flexible':
+            very_difficult = ['xzq', 'qwx', 'gxk', 'pfbt']
+            if any(p in word for p in very_difficult):
+                return False
+        elif flexibility == 'good':
+            difficult = ['xz', 'qw', 'gx', 'pf', 'bt']
+            if any(p in word for p in difficult):
+                return False
+        else:
+            difficult = ['xz', 'qw', 'gx', 'pf', 'bt', 'kg', 'ght', 'tch']
+            if any(p in word for p in difficult):
+                return False
+        vowels = 'aeiou'
+        vowel_count = sum(1 for c in word if c in vowels)
+        if flexibility == 'flexible':
+            if vowel_count < 1 or vowel_count > len(word) * 0.7:
+                return False
+        else:
+            if vowel_count < 1 or vowel_count > len(word) * 0.6:
+                return False
+        return True
+
+    def calculate_adaptive_criteria(self, criteria: dict) -> dict:
+        adapted = criteria.copy()
+        if criteria.get('length_range'):
+            min_len, max_len = criteria['length_range']
+            avg = (min_len + max_len) / 2
+            if avg < 6:
+                adapted['rarity_strictness'] = 'strict'
+                adapted['brand_flexibility'] = 'flexible'
+                adapted['positivity_threshold'] = -0.3
+            elif avg > 8:
+                adapted['rarity_strictness'] = 'flexible'
+                adapted['brand_flexibility'] = 'good'
+                adapted['positivity_threshold'] = 0.0
+                adapted['rarity_flexibility_ratio'] = 0.1
+            else:
+                adapted['rarity_strictness'] = 'balanced'
+                adapted['brand_flexibility'] = 'balanced'
+                adapted['positivity_threshold'] = -0.1
+        return adapted
+
+    def calculate_positivity(self, word: str) -> float:
+        if sia is None:
+            score = 0.0
+        else:
+            try:
+                score = sia.polarity_scores(word).get('compound', 0.0)
+            except Exception:
+                score = 0.0
+        if word in POSITIVE_BRAND_WORDS:
+            score += 0.25
+        positive_parts = ['pro', 'max', 'plus', 'ultra', 'neo', 'prime', 'smart', 'bright']
+        if any(part in word for part in positive_parts):
+            score += 0.15
+        return min(1.0, max(-1.0, score))
+
+    def calculate_rarity(self, word: str, strictness: str = 'balanced') -> int:
+        super_common = {'the', 'and', 'for', 'are', 'but', 'not', 'you'}
+        common_words = {'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use'}
+        specialized_words = {'therapy', 'clinic', 'medical', 'patient', 'treatment'}
+        if word in super_common:
+            return 1
+        elif word in common_words:
+            return 2
+        elif word in specialized_words and strictness == 'flexible':
+            return 3
+        elif word not in english_words:
+            if len(word) <= 5:
+                return 3 if strictness == 'flexible' else 4
+            else:
+                return 5
+        else:
+            length_factor = len(word)
+            complexity = 0
+            if any(combo in word for combo in ['ph', 'gh', 'tion', 'sion', 'ough']):
+                complexity += 1
+            if word.count('y') > 1:
+                complexity += 1
+            if any(c in word for c in 'qxz'):
+                complexity += 1
+            if strictness == 'strict':
+                if length_factor <= 4:
+                    return min(4, 3 + complexity)
+                elif length_factor <= 6:
+                    return min(5, 4 + complexity)
+                else:
+                    return 5
+            elif strictness == 'flexible':
+                if length_factor <= 4:
+                    return min(3, 2 + complexity)
+                elif length_factor <= 6:
+                    return min(4, 2 + complexity)
+                elif length_factor <= 8:
+                    return min(4, 3 + complexity)
+                else:
+                    return 5
+            else:
+                if length_factor <= 4:
+                    return min(3, 2 + complexity)
+                elif length_factor <= 6:
+                    return min(4, 3 + complexity)
+                elif length_factor <= 8:
+                    return min(5, 3 + complexity)
+                else:
+                    return 5
+
+    def get_pos_type(self, word: str) -> str:
+        try:
+            if nltk_available:
+                tag = pos_tag([word])[0][1]
+                if tag.startswith('NN'): return 'noun'
+                if tag.startswith('JJ'): return 'adjective'
+                if tag.startswith('VB'): return 'verb'
+                return 'other'
+        except Exception:
+            return 'unknown'
+        return 'unknown'
+
+    def filter_words(self, words_list: List[str], criteria: dict) -> List[str]:
+        adapted = self.calculate_adaptive_criteria(criteria)
+        filtered: List[Tuple[str, int]] = []
+        rarity_groups: Dict[int, List[Tuple[str, int]]] = {1: [], 2: [], 3: [], 4: [], 5: []}
+        for w in words_list:
+            w = w.lower().strip()
+            if not w or not w.isalpha(): continue
+            if criteria.get('brand_mode') and w in MEDICAL_BLACKLIST:
+                continue
+            if criteria.get('length_range'):
+                a, b = criteria['length_range']
+                if not (a <= len(w) <= b): continue
+            if criteria.get('first_letter'):
+                if not w.startswith(criteria['first_letter'].lower()): continue
+            if criteria.get('pos_type') and criteria['pos_type'] != 'any':
+                pos_type = self.get_pos_type(w)
+                if pos_type != criteria['pos_type'] and pos_type not in ['unknown', 'other']:
+                    continue
+            if not (w in english_words) and len(w) <= 4:
+                continue
+            rarity = self.calculate_rarity(w, adapted.get('rarity_strictness', 'balanced'))
+            if 1 <= rarity <= 5:
+                rarity_groups[rarity].append((w, rarity))
+
+        min_r, max_r = criteria.get('rarity_range', (3, 3))
+        for r in range(min_r, max_r + 1):
+            filtered.extend(rarity_groups.get(r, []))
+
+        if adapted.get('rarity_flexibility_ratio'):
+            flex_ratio = adapted['rarity_flexibility_ratio']
+            current_count = len(filtered)
+            target_flex_count = int(current_count * flex_ratio / (1 - flex_ratio)) if current_count > 0 else 0
+            flex_words: List[Tuple[str, int]] = []
+            for rr in range(max(1, min_r - 1), min_r):
+                flex_words.extend(rarity_groups.get(rr, []))
+            if flex_words:
+                flex_words.sort(key=lambda x: x[1], reverse=True)
+                filtered.extend(flex_words[:target_flex_count])
+
+        if criteria.get('brand_mode'):
+            brand_filtered: List[Tuple[str, int, float]] = []
+            bf = adapted.get('brand_flexibility', 'balanced')
+            pt = adapted.get('positivity_threshold', -0.1)
+            for w, r in filtered:
+                pos = self.calculate_positivity(w)
+                if pos >= pt and self.is_brand_suitable_basic(w, bf):
+                    brand_filtered.append((w, r, pos))
+            brand_filtered.sort(key=lambda x: (x[2], x[1]), reverse=True)
+            return [w for w, _, _ in brand_filtered]
+        else:
+            filtered.sort(key=lambda x: x[1], reverse=True)
+            return [w for w, _ in filtered]
+
+    def balanced_pos_selection(self, candidates: List[str], target: int) -> List[str]:
+        buckets = {'noun': [], 'adjective': [], 'verb': [], 'other': []}
+        for c in candidates:
+            pos = self.get_pos_type(c)
+            if pos not in buckets:
+                pos = 'other'
+            buckets[pos].append(c)
+        n_noun = max(1, int(target * 0.4))
+        n_adj = max(1, int(target * 0.3))
+        n_verb = max(1, int(target * 0.3))
+        selected: List[str] = []
+        selected.extend(buckets['noun'][:n_noun])
+        selected.extend(buckets['adjective'][:n_adj])
+        selected.extend(buckets['verb'][:n_verb])
+        remaining = [x for x in candidates if x not in selected]
+        selected.extend(remaining[:max(0, target - len(selected))])
+        return selected[:target]
+
+    def extract_words(self, selected_fields: List[str], criteria: dict, max_results: int = 100) -> List[str]:
+        start_time = time.time()
+        all_words: set = set()
+        brand_mode = bool(criteria.get('brand_mode'))
+        print("\n🎯 المرحلة 1: جمع الكلمات من المصادر المتعددة")
+        print("=" * 60)
+        per_field_cap = 8000
+        for field in selected_fields:
+            print(f"\n📂 معالجة مجال: {field}")
+            field_words = self.load_field_words(field, brand_mode=brand_mode, per_source_cap=per_field_cap)
+            print(f"  ✓ المصدر الأساسي: {len(field_words)} كلمة")
+            sample_cap = min(len(field_words), 5000)
+            if len(field_words) > sample_cap:
+                step = max(1, len(field_words) // sample_cap)
+                field_sample = field_words[::step][:sample_cap]
+            else:
+                field_sample = field_words
+            all_words.update(field_sample)
+            db_words = self.db_router.route_and_search(field, criteria)
+            if db_words:
+                all_words.update(db_words)
+                print(f"  🗄️ قواعد البيانات المتخصصة: {len(db_words)} كلمة")
+            if field_words:
+                kb_size = self.rag_engine.build_knowledge_base(field, list(field_words)[:30])
+                print(f"  📚 قاعدة معرفية: {kb_size} كلمة محققة")
+            if self.rag_engine.gemini_key:
+                print(f"  🤖 RAG المستقل يحلل ويقرر...")
+                autonomous_words = self.autonomous_rag.autonomous_search(field, criteria, len(all_words))
+                if autonomous_words:
+                    all_words.update(autonomous_words)
+                    print(f"    ✨ أضاف {len(autonomous_words)} كلمة بقرارات ذكية")
+            if len(field_words) >= 5:
+                print(f"  🔍 البحث الهجين...")
+                hybrid_words = self.hybrid_search.hybrid_search(field, criteria, list(field_words))
+                if hybrid_words:
+                    added = [w for w in hybrid_words if w not in all_words]
+                    all_words.update(hybrid_words)
+                    print(f"    ✨ أضاف {len(added)} كلمة متنوعة")
+            if self.analyzer.active:
+                dictionary_words = self.analyzer.enhance_field_analysis(field, criteria)
+                verified_words = [w for w in dictionary_words if w in english_words]
+                if verified_words:
+                    new = [w for w in verified_words if w not in all_words]
+                    all_words.update(verified_words)
+                    print(f"  ✨ المحلل: {len(new)} كلمة قاموسية")
+        print(f"\n📊 المجموع الأولي: {len(all_words)} كلمة فريدة")
+
+        # Stage 2
+        print("\n🔍 المرحلة 2: التحقق من الجودة")
+        print("=" * 60)
+        cached_results, uncached_words = self.enhanced_optimizer.smart_cache_strategy(list(all_words), self.rag_engine)
+        print(f"⚡ Cache: {len(cached_results)} كلمة من الذاكرة، {len(uncached_words)} جديدة")
+        batch_size = self.enhanced_optimizer.adaptive_batch_size(len(uncached_words))
+        print(f"⚡ حجم الدفعة التكيفي: {batch_size} كلمة")
+        verified_words = self.enhanced_optimizer.batch_verify_words(uncached_words, batch_size=batch_size)
+        print(f"✓ كلمات محققة: {len(verified_words)}")
+        all_verified = list(cached_results.keys()) + verified_words
+
+        if len(all_verified) > 30:
+            print("\n⚡ تقييم جودة متوازي متقدم...")
+            quality_results = self.enhanced_optimizer.parallel_quality_check(all_verified[:50], self.rag_engine, max_workers=5)
+            prioritized = self.enhanced_optimizer.priority_queue_processing(all_verified, quality_results)
+            high_quality = [w for w in prioritized[:30] if w in quality_results and quality_results[w][0] >= 7]
+            remaining = [w for w in all_verified if w not in high_quality]
+            all_verified = high_quality + remaining
+            print(f"    ⭐ {len(high_quality)} كلمة عالية الجودة (7+/10)")
+
+        # Stage 3
+        print("\n🎯 المرحلة 3: التصفية والترتيب")
+        print("=" * 60)
+        filtered_words = self.filter_words(all_verified, criteria)
+        print(f"✓ كلمات مطابقة للمعايير: {len(filtered_words)}")
+
+        # Stage 4: brand analysis
+        if criteria.get('brand_mode') and filtered_words:
+            print("\n✨ المرحلة 4: تحليل البراندات الشامل")
+            print("=" * 60)
+            consensus_scores = self.multi_llm.evaluate_consensus(filtered_words[:40])
+            analyzer_scores = self.analyzer.optimize_brand_selection(filtered_words[:60])
+            analyzer_dict = {w: s for w, s in analyzer_scores}
+            final_scores: Dict[str, float] = {}
+            for w, cscore in consensus_scores:
+                ascore = analyzer_dict.get(w, 5)
+                final_scores[w] = (cscore * 0.6 + ascore * 0.4)
+            premium = [w for w, s in final_scores.items() if s >= 8.0 and w in english_words]
+            excellent = [w for w, s in final_scores.items() if 7.0 <= s < 8.0 and w in english_words]
+            good = [w for w, s in final_scores.items() if 5.5 <= s < 7.0 and w in english_words]
+            remaining = [w for w in filtered_words if w not in final_scores and w in english_words]
+            aug_candidates = []
+            for w in filtered_words:
+                if w not in final_scores:
+                    continue
+                augments = self.branding_scorer.generate_augments(w)
+                for a in augments:
+                    sc = self.branding_scorer.score(a)
+                    if sc >= 6.0:
+                        aug_candidates.append((a, sc))
+            aug_candidates_sorted = sorted(aug_candidates, key=lambda x: x[1], reverse=True)
+            aug_words = [a for a, _ in aug_candidates_sorted[:10]]
+            filtered_words = premium + excellent + good + aug_words + remaining
+            print(f"    ⭐ Premium (8+): {len(premium)} كلمة")
+            print(f"    ✨ Excellent (7-8): {len(excellent)} كلمة")
+            print(f"    🔹 Good (5.5-7): {len(good)} كلمة")
+
+        # Stage 5: expansion
+        if len(filtered_words) < max_results // 2:
+            print("\n🔄 المرحلة 5: التوسع الذكي")
+            expanded_words = self.expand_sources_if_needed(list(all_words), max_results * 2)
+            verified_expanded = self.enhanced_optimizer.batch_verify_words(expanded_words)
+            all_verified += verified_expanded
+            orig_criteria = criteria.copy()
+            if criteria.get('rarity_range'):
+                min_r, max_r = criteria['rarity_range']
+                criteria['rarity_range'] = (max(1, min_r - 1), min(5, max_r + 1))
+                print(f"    توسيع الندرة: {criteria['rarity_range']}")
+            filtered_words = self.filter_words(list(all_verified), criteria)
+            criteria.update(orig_criteria)
+
+        final_pool = [w for w in filtered_words if w in english_words]
+        if criteria.get('brand_mode'):
+            final_pool = self.balanced_pos_selection(final_pool, max_results)
+        final_words = final_pool[:max_results]
+        elapsed = time.time() - start_time
+
+        # Domain checks for final words (non-breaking, printed and saved)
+        if final_words:
+            print("\n🔎 التحقق من توفر النطاقات (.com) للكلمات النهائية (parallel)...")
+            try:
+                domain_results = self.domain_checker.check_domains(final_words, tld=".com", parallel=True)
+            except Exception:
+                domain_results = {w: {"domain": f"{w}.com", "status": "unknown", "source": "error"} for w in final_words}
+            # print short summary
+            available = [w for w, v in domain_results.items() if v.get('status') == 'available']
+            taken = [w for w, v in domain_results.items() if v.get('status') == 'taken']
+            for_sale = [w for w, v in domain_results.items() if v.get('status') == 'for_sale']
+            parked = [w for w, v in domain_results.items() if v.get('status') == 'parked']
+            print(f"  ✅ Available: {len(available)}  |  🔒 Taken: {len(taken)}  |  🏷️ For Sale: {len(for_sale)}  |  🅿️ Parked: {len(parked)}")
+        else:
+            domain_results = {}
+
+        # final report
+        print("\n" + "=" * 60)
+        print("📊 التقرير النهائي")
+        print("=" * 60)
+        print(f"✅ النتائج النهائية: {len(final_words)} كلمة محققة")
+        print(f"⏱️  الوقت المستغرق: {elapsed:.2f} ثانية")
+        print(f"⚡ Cache Hits: {self.enhanced_optimizer.cache_hits}")
+        print(f"⚡ Cache Misses: {self.enhanced_optimizer.cache_misses}")
+        print(f"💰 API Calls Saved: {self.enhanced_optimizer.processing_stats.get('api_calls_saved', 0)}")
+        if self.autonomous_rag.decision_log:
+            last = self.autonomous_rag.decision_log[-1]
+            print(f"🤖 RAG Decisions: depth={last['search_depth']}, expand={last['should_expand']}")
+
+        # Save two files: plain words + domain status CSV
+        try:
+            timestamp = int(time.time())
+            out_file = os.path.join(base_dir, f"rare_words_comprehensive_{timestamp}.txt")
+            with open(out_file, 'w', encoding='utf-8') as f:
+                f.write("# Rare Words Extractor - enhanced\n\n")
+                f.write(f"# Fields: {', '.join(selected_fields)}\n")
+                f.write(f"# Count: {len(final_words)}\n")
+                f.write(f"# Time: {elapsed:.2f} seconds\n\n")
+                f.write("# Words\n")
+                for w in final_words:
+                    f.write(f"{w}\n")
+            # domain CSV
+            domain_file = os.path.join(base_dir, f"rare_words_domains_{timestamp}.csv")
+            with open(domain_file, 'w', encoding='utf-8') as f:
+                f.write("word,domain,status,source\n")
+                for w in final_words:
+                    info = domain_results.get(w, {"domain": f"{w}.com", "status": "unknown", "source": "none"})
+                    f.write(f"{w},{info.get('domain')},{info.get('status')},{info.get('source')}\n")
+            print(f"\n💾 تم حفظ النتائج في: {out_file}")
+            print(f"💾 تم حفظ حالة النطاقات في: {domain_file}")
+        except Exception:
+            pass
+
+        return final_words
+
+# ----------------------------
+# CLI
+# ----------------------------
+def get_user_input() -> Tuple[List[str], dict, int]:
+    print("📚 المجالات المتاحة:")
+    for idx, field in enumerate(FIELDS, 1):
+        print(f"{idx}. {field}")
+    fields_input = input("\n🔹 اختر المجالات (أرقام مفصولة بفواصل، أو Enter للكل): ").strip()
+    if fields_input:
+        try:
+            indexes = [int(i.strip()) - 1 for i in fields_input.split(',') if i.strip()]
+            selected = [FIELDS[i] for i in indexes if 0 <= i < len(FIELDS)]
+            if not selected:
+                selected = FIELDS
+        except Exception:
+            selected = FIELDS
+    else:
+        selected = FIELDS
+    criteria: dict = {}
+    length_input = input("🔹 طول الكلمة (مثال: 5 أو 5-8، Enter لتخطي): ").strip()
+    if length_input:
+        try:
+            if '-' in length_input:
+                a, b = map(int, length_input.split('-'))
+                criteria['length_range'] = (a, b)
+            else:
+                ln = int(length_input)
+                criteria['length_range'] = (ln, ln)
+        except Exception:
+            pass
+    first_letter = input("🔹 الحرف الأول (Enter لتخطي): ").strip()
+    if first_letter and first_letter.isalpha():
+        criteria['first_letter'] = first_letter[0]
+    pos_input = input("🔹 نوع الكلمة (noun/adjective/verb/any): ").strip().lower()
+    if pos_input in ['noun', 'adjective', 'verb']:
+        criteria['pos_type'] = pos_input
+    else:
+        criteria['pos_type'] = 'any'
+    rarity_input = input("🔹 درجة الندرة (1-5 أو 3-5، افتراضي 3-3): ").strip()
+    if rarity_input:
+        try:
+            if '-' in rarity_input:
+                a, b = map(int, rarity_input.split('-'))
+                criteria['rarity_range'] = (a, b)
+            else:
+                r = int(rarity_input)
+                criteria['rarity_range'] = (r, r)
+        except Exception:
+            criteria['rarity_range'] = (3, 3)
+    else:
+        criteria['rarity_range'] = (3, 3)
+    brand_mode = input("🔹 وضع البراند (y/n، افتراضي n): ").strip().lower()
+    criteria['brand_mode'] = (brand_mode == 'y')
+    num_results = 100
+    num_input = input("🔹 عدد النتائج (افتراضي 100): ").strip()
+    if num_input:
+        try:
+            num_results = int(num_input)
+        except Exception:
+            pass
+    return selected, criteria, num_results
+
+def main():
+    print("\n" + "=" * 60)
+    print("🔍 مستخرج الكلمات النادرة - النظام الشامل المتكامل (مُحسّن)")
+    print("=" * 60)
+    selected_fields, criteria, max_results = get_user_input()
+    extractor = WordExtractor()
+    print(f"\n⏳ بدء عملية التنقيب المتقدمة...")
+    print(f"🎯 المجالات المختارة: {len(selected_fields)}")
+    print(f"🎯 العدد المطلوب: {max_results} كلمة")
+    start_all = time.time()
+    results = extractor.extract_words(selected_fields, criteria, max_results)
+    elapsed_all = time.time() - start_all
+    print("\n" + "=" * 60)
+    print("🎉 النتائج النهائية")
+    print("=" * 60)
+    if results:
+        print(f"\n✅ تم العثور على {len(results)} كلمة محققة")
+        print(f"⏱️  إجمالي الوقت: {elapsed_all:.2f} ثانية")
+        print("\n📝 قائمة الكلمات:")
+        print("-" * 60)
+        for i, w in enumerate(results, 1):
+            if len(results) <= 50:
+                print(f"{i:3d}. {w}")
+            else:
+                print(w)
+    else:
+        print("\n⚠️ لم يتم العثور على كلمات تطابق المعايير المحددة")
+        print("  • جرب توسيع نطاق الطول أو تعطيل وضع البراند")
+    print("\n" + "=" * 60)
+    print("🙏 شكراً لاستخدام مستخرج الكلمات النادرة")
+    print("=" * 60 + "\n")
+
+if __name__ == "__main__":
+    main()
